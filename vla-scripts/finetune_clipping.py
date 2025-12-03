@@ -1,9 +1,3 @@
-"""
-finetune.py
-
-Fine-tunes Qwen2.5-0.5B via LoRA.
-"""
-
 import os
 import time
 from collections import deque
@@ -58,76 +52,79 @@ from prismatic.vla.datasets import RLDSDataset, RLDSBatchTransform
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from prismatic.models import load, load_vla
 
-
-
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+
 
 @dataclass
 class FinetuneConfig:
     # fmt: off
-    config_file_path: str = "openvla/openvla-7b"     # Path to necessary config files of LA-Adapter
-    vlm_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
-    use_minivlm: bool = False                        # 
-    resum_vla_path: str = "openvla/openvla-7b"       # Path to OpenVLA model (on HuggingFace Hub or stored locally)
+    config_file_path: str = "openvla/openvla-7b"  # Path to necessary config files of LA-Adapter
+    vlm_path: str = "openvla/openvla-7b"  # Path to OpenVLA model (on HuggingFace Hub or stored locally)
+    use_minivlm: bool = False  #
+    resum_vla_path: str = "openvla/openvla-7b"  # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
     # Dataset
-    data_root_dir: Path = Path("datasets/rlds")      # Directory containing RLDS datasets
-    dataset_name: str = "aloha_scoop_x_into_bowl"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
-    run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
-    shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
+    data_root_dir: Path = Path("datasets/rlds")  # Directory containing RLDS datasets
+    dataset_name: str = "aloha_scoop_x_into_bowl"  # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
+    run_root_dir: Path = Path("runs")  # Path to directory to store logs & checkpoints
+    shuffle_buffer_size: int = 100_000  # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
     # Algorithm and architecture
-    use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
-    use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
-    num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for training 
-    use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
-    num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
-    use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    use_l1_regression: bool = True  # If True, trains continuous action head with L1 regression objective
+    use_diffusion: bool = False  # If True, trains continuous action head with diffusion modeling objective (DDIM)
+    num_diffusion_steps: int = 50  # (When `diffusion==True`) Number of diffusion steps for training
+    use_film: bool = False  # If True, uses FiLM to infuse language inputs into visual features
+    num_images_in_input: int = 1  # Number of images in the VLA input (default: 1)
+    use_proprio: bool = False  # If True, includes robot proprioceptive state in input
     phase1_path: str = "None"
 
     # Training configuration
-    batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
-    learning_rate: float = 5e-4                      # Learning rate
-    lr_warmup_steps: int = 0.1                       # Number of steps to warm up learning rate (from 10% to 100%)
-    num_steps_before_decay: int = 100000             # Number of steps before LR decays by 10x
-    grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
-    max_steps: int = 200000                          # Max number of training steps
-    use_val_set: bool = False                        # If True, uses validation set and log validation metrics
-    val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
-    val_time_limit: int = 180                        # (When `use_val_set==True`) Time limit for computing validation metrics
-    save_freq: int = 10_000                          # Checkpoint saving frequency in steps
-    save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
-                                                     #   (If False, saves all checkpoints)
-    resume: bool = False                             # If True, resumes from checkpoint
-    resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
-    image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
-    diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
+    batch_size: int = 8  # Batch size per device (total batch size = batch_size * num GPUs)
+    learning_rate: float = 5e-4  # Learning rate
+    # 新增：为VLM和action expert分别设置学习率
+    vlm_learning_rate: float = 1e-5  # VLM部分的学习率
+    action_expert_learning_rate: float = 5e-4  # Action expert部分的学习率
+    # 新增：梯度裁剪参数
+    action_expert_grad_clip: float = 1.0  # Action expert的梯度裁剪阈值
+    lr_warmup_steps: int = 0.1  # Number of steps to warm up learning rate (from 10% to 100%)
+    num_steps_before_decay: int = 100000  # Number of steps before LR decays by 10x
+    grad_accumulation_steps: int = 1  # Number of gradient accumulation steps
+    max_steps: int = 200000  # Max number of training steps
+    use_val_set: bool = False  # If True, uses validation set and log validation metrics
+    val_freq: int = 10_000  # (When `use_val_set==True`) Validation set logging frequency in steps
+    val_time_limit: int = 180  # (When `use_val_set==True`) Time limit for computing validation metrics
+    save_freq: int = 10_000  # Checkpoint saving frequency in steps
+    save_latest_checkpoint_only: bool = False  # If True, saves only 1 checkpoint, overwriting latest checkpoint
+    #   (If False, saves all checkpoints)
+    resume: bool = False  # If True, resumes from checkpoint
+    resume_step: Optional[int] = None  # (When `resume==True`) Step number that we are resuming from
+    image_aug: bool = True  # If True, trains with image augmentations (HIGHLY RECOMMENDED)
+    diffusion_sample_freq: int = 50  # (When `use_diffusion==True`) Frequency for sampling in steps
 
     # LoRA
-    use_lora: bool = False                           # If True, uses LoRA fine-tuning
-    lora_rank: int = 32                              # Rank of LoRA weight matrix
-    lora_dropout: float = 0.0                        # Dropout applied to LoRA weights
-    merge_lora_during_training: bool = False         # If True, merges LoRA weights and saves result during training
-                                                     #   Note: Merging can be very slow on some machines. If so, set to
-                                                     #         False and merge final checkpoint offline!
+    use_lora: bool = False  # If True, uses LoRA fine-tuning
+    lora_rank: int = 32  # Rank of LoRA weight matrix
+    lora_dropout: float = 0.0  # Dropout applied to LoRA weights
+    merge_lora_during_training: bool = False  # If True, merges LoRA weights and saves result during training
+    #   Note: Merging can be very slow on some machines. If so, set to
+    #         False and merge final checkpoint offline!
 
     # Full Finetune
-    use_fz: bool = False                             # If True, uses LoRA fine-tuning
+    use_fz: bool = False  # If True, uses LoRA fine-tuning
 
     # Logging
-    wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
-    wandb_project: str = "your-wandb-project"        # Name of WandB project
-    run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
-    run_id_override: Optional[str] = None            # Optional string to override the run ID with
-    wandb_log_freq: int = 10                         # WandB logging frequency in steps
+    wandb_entity: str = "your-wandb-entity"  # Name of WandB entity
+    wandb_project: str = "your-wandb-project"  # Name of WandB project
+    run_id_note: Optional[str] = None  # Extra note to add to end of run ID for logging
+    run_id_override: Optional[str] = None  # Optional string to override the run ID with
+    wandb_log_freq: int = 10  # WandB logging frequency in steps
 
     # revision version
-    use_pro_version: bool = True                             # the version number
+    use_pro_version: bool = True  # the version number
     phase: str = "Training"
     # fmt: on
-
-
 
 def remove_ddp_in_checkpoint(state_dict) -> dict:
     """
@@ -152,7 +149,6 @@ def remove_ddp_in_checkpoint(state_dict) -> dict:
         else:
             new_state_dict[k] = v
     return new_state_dict
-
 
 
 def get_run_id(cfg) -> str:
@@ -190,8 +186,6 @@ def get_run_id(cfg) -> str:
             run_id += f"--{cfg.run_id_note}"
     return run_id
 
-
-
 def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu") -> dict:
     """
     Loads a checkpoint for a given module.
@@ -211,7 +205,6 @@ def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu")
     return remove_ddp_in_checkpoint(state_dict)
 
 
-
 def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DDP:
     """
     Wrap a module with DistributedDataParallel.
@@ -226,8 +219,6 @@ def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DD
     """
     return DDP(module, device_ids=[device_id], find_unused_parameters=find_unused, gradient_as_bucket_view=True)
 
-
-
 def count_parameters(module: nn.Module, name: str) -> None:
     """
     Counts and prints the number of trainable parameters in a module.
@@ -240,19 +231,18 @@ def count_parameters(module: nn.Module, name: str) -> None:
         None.
     """
     num_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
-    
+
     print(f"# trainable params in {name}: {num_params}")
 
 
-
 def init_module(
-    module_class: Type[nn.Module],
-    module_name: str,
-    cfg: FinetuneConfig,
-    device_id: int,
-    module_args: dict,
-    to_bf16: bool = False,
-    find_unused_params: bool = False,
+        module_class: Type[nn.Module],
+        module_name: str,
+        cfg: FinetuneConfig,
+        device_id: int,
+        module_args: dict,
+        to_bf16: bool = False,
+        find_unused_params: bool = False,
 ) -> DDP:
     """
     Initializes a module, optionally loads checkpoint, moves to device, and wraps with DDP.
@@ -284,21 +274,20 @@ def init_module(
     return wrap_ddp(module, device_id, find_unused_params)
 
 
-
 def run_forward_pass(
-    vla,
-    action_head,
-    proprio_projector,
-    batch,
-    action_tokenizer,
-    device_id,
-    use_l1_regression,
-    use_proprio,
-    use_film,
-    num_patches,
-    compute_diffusion_l1=False,
-    use_pro_version=True,
-    cfg=None
+        vla,
+        action_head,
+        proprio_projector,
+        batch,
+        action_tokenizer,
+        device_id,
+        use_l1_regression,
+        use_proprio,
+        use_film,
+        num_patches,
+        compute_diffusion_l1=False,
+        use_pro_version=True,
+        cfg=None
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -345,10 +334,10 @@ def run_forward_pass(
             noisy_action_projector=None,
             diffusion_timestep_embeddings=None,
             use_film=use_film,
-            )
+        )
 
     # Get action masks needed for logging
-    ground_truth_token_ids = batch["labels"][:,1:].to(device_id)
+    ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
     current_action_mask = get_current_action_mask(ground_truth_token_ids)
     next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
 
@@ -358,28 +347,28 @@ def run_forward_pass(
         predicted_token_ids = output.logits[:, num_patches:-1].argmax(dim=2)
 
         curr_action_accuracy = compute_token_accuracy(
-            predicted_token_ids, 
-            ground_truth_token_ids, 
+            predicted_token_ids,
+            ground_truth_token_ids,
             mask=current_action_mask
-            )
+        )
         curr_action_l1_loss = compute_actions_l1_loss(
-            action_tokenizer, 
-            predicted_token_ids, 
-            ground_truth_token_ids, 
+            action_tokenizer,
+            predicted_token_ids,
+            ground_truth_token_ids,
             mask=current_action_mask
-            )
+        )
         next_actions_accuracy = compute_token_accuracy(
-            predicted_token_ids, 
-            ground_truth_token_ids, 
+            predicted_token_ids,
+            ground_truth_token_ids,
             mask=next_actions_mask
-            )
+        )
         next_actions_l1_loss = compute_actions_l1_loss(
-            action_tokenizer, 
-            predicted_token_ids, 
-            ground_truth_token_ids, 
+            action_tokenizer,
+            predicted_token_ids,
+            ground_truth_token_ids,
             mask=next_actions_mask
-            )
-        
+        )
+
         metrics.update(
             {
                 "loss_value": loss.item(),  # Detached value for logging
@@ -387,14 +376,14 @@ def run_forward_pass(
                 "curr_action_l1_loss": curr_action_l1_loss.item(),
                 "next_actions_accuracy": next_actions_accuracy.item(),
                 "next_actions_l1_loss": next_actions_l1_loss.item(),
-                }
-            )
-        
+            }
+        )
+
     # Compute metrics for continuous action representations (L1 regression)
     else:
         # Get last layer hidden states
         multi_layer_hidden_states = []
-        
+
         for item in output.hidden_states[0:]:
             # last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
             # Get hidden states for text portion of prompt+response (after the vision patches)
@@ -402,18 +391,21 @@ def run_forward_pass(
             # Get hidden states for action portion of response
             batch_size = batch["input_ids"].shape[0]
             # actions_hidden_states = text_hidden_states[:, -1, :].reshape(batch_size, 1, -1).to(torch.bfloat16)
-            actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(batch_size, 1,NUM_TOKENS, -1).to(torch.bfloat16)
-            task_latten_states = item[:, :num_patches].reshape(batch_size, 1, num_patches , -1)
-            all_hidden_states = torch.cat((task_latten_states, actions_hidden_states),2)
+            actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(batch_size, 1,
+                                                                                                        NUM_TOKENS,
+                                                                                                        -1).to(
+                torch.bfloat16)
+            task_latten_states = item[:, :num_patches].reshape(batch_size, 1, num_patches, -1)
+            all_hidden_states = torch.cat((task_latten_states, actions_hidden_states), 2)
             multi_layer_hidden_states.append(all_hidden_states)
-        multi_layer_hidden_states = torch.cat(multi_layer_hidden_states, dim = 1)
+        multi_layer_hidden_states = torch.cat(multi_layer_hidden_states, dim=1)
 
         predicted_actions = action_head.module.predict_action(
             multi_layer_hidden_states,
             proprio=batch["proprio"] if use_proprio else None,
             proprio_projector=proprio_projector if use_proprio else None,
             phase=cfg.phase,
-            )
+        )
 
         loss = torch.nn.L1Loss()(predicted_actions, ground_truth_actions)
 
@@ -433,7 +425,7 @@ def run_forward_pass(
             curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
             next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
             if compute_diffusion_l1:
-                print('curr: ',curr_action_l1_loss.item())
+                print('curr: ', curr_action_l1_loss.item())
                 # print('next: ',next_actions_l1_loss.item())
 
             metrics.update(
@@ -445,8 +437,6 @@ def run_forward_pass(
 
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
     return loss, metrics
-
-
 
 def compute_smoothened_metrics(metrics_deques) -> dict:
     """
@@ -463,8 +453,6 @@ def compute_smoothened_metrics(metrics_deques) -> dict:
         if deque and len(deque) > 0:
             smoothened_metrics[name] = sum(deque) / len(deque)
     return smoothened_metrics
-
-
 
 def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
     """
@@ -490,20 +478,19 @@ def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
     wandb_entity.log(log_dict, step=step)
 
 
-
 def save_training_checkpoint(
-    cfg,
-    run_dir,
-    log_step,
-    vla,
-    processor,
-    proprio_projector,
-    noisy_action_projector,
-    action_head,
-    train_dataset,
-    distributed_state,
-    new_state_dict,
-    
+        cfg,
+        run_dir,
+        log_step,
+        vla,
+        processor,
+        proprio_projector,
+        noisy_action_projector,
+        action_head,
+        train_dataset,
+        distributed_state,
+        new_state_dict,
+
 ) -> None:
     """
     Save all training checkpoints including model components, LoRA adapter, and dataset statistics.
@@ -549,7 +536,7 @@ def save_training_checkpoint(
         processor.save_pretrained(checkpoint_dir)
 
         if cfg.use_fz:
-            vla.module.save_pretrained(checkpoint_dir) # directly save checkpoint without lora
+            vla.module.save_pretrained(checkpoint_dir)  # directly save checkpoint without lora
         else:
             vla.module.save_pretrained(adapter_dir)
 
@@ -559,7 +546,8 @@ def save_training_checkpoint(
 
         if cfg.use_diffusion and noisy_action_projector is not None:
             torch.save(
-                noisy_action_projector.state_dict(), checkpoint_dir / f"noisy_action_projector--{checkpoint_name_suffix}"
+                noisy_action_projector.state_dict(),
+                checkpoint_dir / f"noisy_action_projector--{checkpoint_name_suffix}"
             )
 
         if cfg.use_l1_regression and action_head is not None:
@@ -579,16 +567,17 @@ def save_training_checkpoint(
     if cfg.use_lora and cfg.merge_lora_during_training:
         if cfg.use_minivlm:
             config = AutoConfig.from_pretrained("pretrained_models/configs/config.json")
-            base_vla = AutoModelForVision2Seq.from_config(config, torch_dtype=torch.bfloat16)  # Create a new model with configuration, the parameters are randomly initialized
+            base_vla = AutoModelForVision2Seq.from_config(config,
+                                                          torch_dtype=torch.bfloat16)  # Create a new model with configuration, the parameters are randomly initialized
             # print(new_state_dict['action_queries.weight'])
-            new_state_dict['action_queries.weight'] = vla.state_dict()['module.base_model.model.action_queries.weight'].cpu()
+            new_state_dict['action_queries.weight'] = vla.state_dict()[
+                'module.base_model.model.action_queries.weight'].cpu()
             missing_keys, unexpected_keys = base_vla.load_state_dict(new_state_dict, strict=False)
-            
+
         else:
             base_vla = AutoModelForVision2Seq.from_pretrained(
-            cfg.config_file_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False, trust_remote_code=False
-        )
-
+                cfg.config_file_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False, trust_remote_code=False
+            )
 
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
@@ -596,25 +585,23 @@ def save_training_checkpoint(
         if distributed_state.is_main_process:
             merged_vla.save_pretrained(checkpoint_dir)
             print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
-        
+
         # Wait for merged model to be saved
         dist.barrier()
 
-
-
 def run_validation(
-    vla,
-    action_head,
-    noisy_action_projector,
-    proprio_projector,
-    val_dataloader,
-    action_tokenizer,
-    device_id,
-    cfg,
-    num_patches,
-    log_step,
-    distributed_state,
-    val_time_limit,
+        vla,
+        action_head,
+        noisy_action_projector,
+        proprio_projector,
+        val_dataloader,
+        action_tokenizer,
+        device_id,
+        cfg,
+        num_patches,
+        log_step,
+        distributed_state,
+        val_time_limit,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -685,7 +672,6 @@ def run_validation(
         log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
 
 
-
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
     """
@@ -701,7 +687,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     Returns:
         None.
-    """ 
+    """
 
     global RAW_STATE_DICT
 
@@ -733,10 +719,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Print detected constants
     print(
         "Detected constants:\n"
-        f"\tNUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}\n"
-        f"\tACTION_DIM: {ACTION_DIM}\n"
-        f"\tPROPRIO_DIM: {PROPRIO_DIM}\n"
-        f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}"
+        f"\tNUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}\n"  # 8
+        f"\tACTION_DIM: {ACTION_DIM}\n"  # 7
+        f"\tPROPRIO_DIM: {PROPRIO_DIM}\n"  # 8
+        f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}"  # bounds_q99
     )
 
     # Two options:
@@ -761,7 +747,6 @@ def finetune(cfg: FinetuneConfig) -> None:
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
         AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-
     # Update config.json and sync model files
     if distributed_state.is_main_process:
         update_auto_map(cfg.config_file_path)
@@ -772,21 +757,23 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Load processor and VLA
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+    print("--1-- config_file_path: ", cfg.config_file_path)
     processor = AutoProcessor.from_pretrained(cfg.config_file_path, trust_remote_code=True)
 
     if cfg.use_minivlm:
-        hf_token = ''
+        hf_token = ' '
         if 'prism-qwen25-extra-dinosiglip-224px-0_5b' in cfg.vlm_path:
-            
+
             vlm = load(cfg.vlm_path, hf_token=hf_token, load_for_training=True)
         else:
             vlm = load_vla(
                 cfg.vlm_path,
                 hf_token=hf_token,
                 load_for_training=True,
-                )
+            )
         config = AutoConfig.from_pretrained("pretrained_models/configs/config.json")
-        vla = AutoModelForVision2Seq.from_config(config, torch_dtype=torch.bfloat16).to(device_id)  # Create a new model with configuration, the parameters are randomly initialized
+        vla = AutoModelForVision2Seq.from_config(config, torch_dtype=torch.bfloat16).to(
+            device_id)  # Create a new model with configuration, the parameters are randomly initialized
         # for name, param in model.named_parameters():
         #     print(f"{name}: {param.shape}")
         replace_map = [
@@ -797,7 +784,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             ("projector.projector.2", "projector.fc2"),
             ("projector.projector.4", "projector.fc3"),
             ("gamma", "scale_factor"),
-            ]
+        ]
 
         def rename_state_dict_keys(state_dict, replace_map):
             new_state_dict = {}
@@ -808,21 +795,21 @@ def finetune(cfg: FinetuneConfig) -> None:
                         new_k = new_k.replace(old, new)
                 new_state_dict[new_k] = v
             return new_state_dict
-        
+
         old_state_dict = vlm.state_dict()
         RAW_STATE_DICT = rename_state_dict_keys(old_state_dict, replace_map)
-    
+
         missing_keys, unexpected_keys = vla.load_state_dict(RAW_STATE_DICT, strict=False)
         del old_state_dict
 
     else:
-        RAW_STATE_DICT ={}
+        RAW_STATE_DICT = {}
         vla = AutoModelForVision2Seq.from_pretrained(
             cfg.config_file_path,
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=False,
             trust_remote_code=False,
-            ).to(device_id)
+        ).to(device_id)
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -830,23 +817,41 @@ def finetune(cfg: FinetuneConfig) -> None:
     # vla.set_version(cfg.version)
 
     if cfg.use_lora:
+        print("lora used")
         lora_config = LoraConfig(
             r=cfg.lora_rank,
-            lora_alpha= 2 * cfg.lora_rank,
+            lora_alpha=2 * cfg.lora_rank,
             lora_dropout=cfg.lora_dropout,
             target_modules="all-linear",
             init_lora_weights="gaussian",
         )
         vla = get_peft_model(vla, lora_config)
         for name, param in vla.named_parameters():
-            if "action_queries" in name:
+            if "action_queries" in name:  # TODO 01
                 param.requires_grad = True
+                print('---action_queries:---', name, 'requires_grad=', param.requires_grad)
+            else:
+                if param.requires_grad:
+                    print('---not action_queries:---', name, 'requires_grad=', param.requires_grad)
+                    # if "blocks.0" in name or "blocks.1" in name or "blocks.2" in name or "blocks.3" in name: # frozen layers: blocks.0/1/2/3   trainable%: 4.4990
+                    # if "blocks.0" in name or "blocks.1" in name or "blocks.2" in name or "blocks.3" in name or "blocks.4" in name \
+                    #     or "blocks.5" in name or "blocks.6" in name or "blocks.7" in name or "blocks.8" in name or "blocks.9" in name \
+                    #     or "blocks.10" in name or "blocks.11" in name or "blocks.12" in name or "blocks.13" in name or "blocks.14" in name \
+                    #     or "blocks.15" in name or "blocks.16" in name or "blocks.17" in name or "blocks.18" in name: # trainable%=3.5305
+                    param.requires_grad = False
+                    print('---set frozen:---', name, 'requires_grad=', param.requires_grad)
+                    # param.requires_grad = False # all layers of VLM frozen
         vla.print_trainable_parameters()
 
     else:
+        print("no lora")
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
+                print('\n---action_queries:---', name, 'requires_grad=', param.requires_grad)
+            else:
+                print('\n---not action_queries:---', name, 'requires_grad=', param.requires_grad)
+                param.requires_grad = False  # all layers of VLM frozen
 
     # FiLM setup
     if cfg.use_film:
@@ -882,35 +887,68 @@ def finetune(cfg: FinetuneConfig) -> None:
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
         action_head = init_module(
-        L1RegressionActionHead,
-        "action_head",
-        cfg,
-        device_id,
-        {
-            "input_dim": vla.module.llm_dim, 
-            "hidden_dim": vla.module.llm_dim, 
-            "action_dim": ACTION_DIM,
-            "use_pro_version": cfg.use_pro_version,
+            L1RegressionActionHead,
+            "action_head",
+            cfg,
+            device_id,
+            {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": vla.module.llm_dim,
+                "action_dim": ACTION_DIM,
+                "use_pro_version": cfg.use_pro_version,
             },
-        to_bf16=True,
+            to_bf16=True,
         )
 
     # Get number of vision patches
     NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
 
-    # Instantiate optimizer
-    trainable_params = [param for param in vla.parameters() if param.requires_grad]
-    if cfg.use_l1_regression:
-        trainable_params += [param for param in action_head.parameters() if param.requires_grad]
+    # ==================== 修改：为VLM和action expert分别设置参数组和学习率 ====================
+    # 分离VLM参数和action expert参数
+    vlm_params = []
+    action_expert_params = []
 
+    # VLA中可训练的参数（主要是LoRA参数和action_queries）
+    for name, param in vla.named_parameters():
+        if param.requires_grad:
+            if "action_queries" in name:
+                action_expert_params.append(param)
+                print(f"Action expert param: {name}")
+            else:
+                vlm_params.append(param)
+                print(f"VLM param: {name}")
+
+    # Action head参数
+    if cfg.use_l1_regression:
+        for name, param in action_head.named_parameters():
+            if param.requires_grad:
+                action_expert_params.append(param)
+                print(f"Action head param: {name}")
+
+    # Proprio projector参数
     if cfg.use_proprio:
-        trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
-    print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+        for name, param in proprio_projector.named_parameters():
+            if param.requires_grad:
+                action_expert_params.append(param)
+                print(f"Proprio projector param: {name}")
+
+    print(f"# VLM trainable params: {sum(p.numel() for p in vlm_params)}")
+    print(f"# Action expert trainable params: {sum(p.numel() for p in action_expert_params)}")
+
+    # 创建参数组，分别设置学习率
+    param_groups = [
+        {'params': vlm_params, 'lr': cfg.vlm_learning_rate},
+        {'params': action_expert_params, 'lr': cfg.action_expert_learning_rate}
+    ]
+
+    optimizer = AdamW(param_groups)
+    # ==================== 修改结束 ====================
 
     # Record original learning rate
-    original_lr = optimizer.param_groups[0]["lr"]
+    original_lr_vlm = optimizer.param_groups[0]["lr"]
+    original_lr_action = optimizer.param_groups[1]["lr"]
+    print(f"original_lr_vlm={original_lr_vlm}, original_lr_action={original_lr_action}")
 
     # Create learning rate scheduler
     # 1. MultiStepLR
@@ -922,8 +960,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     # 2. CosineAnnealingLR
     # scheduler = CosineAnnealingLR(
     #         optimizer,
-    #         T_max=cfg.num_steps_before_decay, 
-    #         eta_min=0.0001,          
+    #         T_max=cfg.num_steps_before_decay,
+    #         eta_min=0.0001,
     #         )
 
     # Create Action Tokenizer
@@ -957,7 +995,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_wrist_image=use_wrist_image,
         use_proprio=cfg.use_proprio,
         use_minivlm=cfg.use_minivlm
-        )
+    )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
         cfg.dataset_name,
@@ -1018,7 +1056,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
             # Compute training metrics and loss
-            compute_diffusion_l1 = (cfg.use_l1_regression and batch_idx % cfg.diffusion_sample_freq == 0) or (cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0)
+            compute_diffusion_l1 = (cfg.use_l1_regression and batch_idx % cfg.diffusion_sample_freq == 0) or (
+                        cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0)
             loss, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
@@ -1041,13 +1080,28 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Backward pass
             normalized_loss.backward()
 
+            # Compute gradient step index
+            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+
+            # ==================== 修改：对action expert进行梯度裁剪 ====================
+            if action_expert_params and cfg.action_expert_grad_clip > 0:
+                action_expert_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    action_expert_params,
+                    cfg.action_expert_grad_clip
+                )
+                # 记录梯度范数用于监控
+                if distributed_state.is_main_process and (batch_idx % cfg.wandb_log_freq == 0):
+                    wandb.log({
+                        "VLA Train/Action Expert Grad Norm": action_expert_grad_norm.item(),
+                    }, step=gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx)
+            # ==================== 修改结束 ====================
+
             # Store recent train metrics
             for metric_name, value in metrics.items():
                 if metric_name in recent_metrics:
                     recent_metrics[metric_name].append(value)
 
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+
 
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
@@ -1060,16 +1114,20 @@ def finetune(cfg: FinetuneConfig) -> None:
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
                 lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
-                current_lr = original_lr * (0.1 + 0.9 * lr_progress)
-                for param_group in optimizer.param_groups:
+                # 分别对两个参数组进行warmup
+                for i, param_group in enumerate(optimizer.param_groups):
+                    if i == 0:  # VLM参数组
+                        current_lr = original_lr_vlm * (0.1 + 0.9 * lr_progress)
+                    else:  # Action expert参数组
+                        current_lr = original_lr_action * (0.1 + 0.9 * lr_progress)
                     param_group["lr"] = current_lr
 
             if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
-                # Log the learning rate
-                # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
+                # Log the learning rates
                 wandb.log(
                     {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
+                        "VLA Train/VLM Learning Rate": optimizer.param_groups[0]["lr"],
+                        "VLA Train/Action Expert Learning Rate": optimizer.param_groups[1]["lr"],
                     },
                     step=log_step,
                 )

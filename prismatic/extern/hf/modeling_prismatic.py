@@ -864,11 +864,28 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Handle different prediction methods
         if action_head is not None:
-            # L1 regression prediction
-            normalized_actions = action_head.predict_action(multi_layer_hidden_states,
-                                                proprio=proprio,
-                                                proprio_projector=proprio_projector)
+            # # L1 regression prediction
+            # normalized_actions = action_head.predict_action(multi_layer_hidden_states,
+            #                                     proprio=proprio,
+            #                                     proprio_projector=proprio_projector)
+            # normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+
+            ## add
+            head_out = action_head.predict_action(
+                multi_layer_hidden_states,
+                proprio=proprio,
+                proprio_projector=proprio_projector,
+                return_dict=getattr(action_head, "num_candidates", None) is not None,
+            )
+
+            if isinstance(head_out, dict):
+                normalized_actions = head_out["actions"]
+            else:
+                normalized_actions = head_out
+
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+
+            
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:
             # Discrete token-based prediction

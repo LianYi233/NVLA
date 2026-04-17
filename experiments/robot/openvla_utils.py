@@ -24,7 +24,7 @@ json_numpy.patch()
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import L1RegressionActionHead
+from prismatic.models.action_heads import L1RegressionActionHead, PathPlannerActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
@@ -500,14 +500,32 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead]:
         else:
             cfg.use_pro_version = False
 
-    # Initialize appropriate action head based on configuration
+    # # Initialize appropriate action head based on configuration
+    # if cfg.use_l1_regression:
+    #     action_head = L1RegressionActionHead(
+    #         input_dim=llm_dim, 
+    #         hidden_dim=llm_dim, 
+    #         action_dim=ACTION_DIM,
+    #         use_pro_version=cfg.use_pro_version,
+    #     )
+
     if cfg.use_l1_regression:
-        action_head = L1RegressionActionHead(
-            input_dim=llm_dim, 
-            hidden_dim=llm_dim, 
-            action_dim=ACTION_DIM,
-            use_pro_version=cfg.use_pro_version,
-        )
+        if getattr(cfg, "use_path_planner", False):
+            action_head = PathPlannerActionHead(
+                input_dim=llm_dim,
+                hidden_dim=llm_dim,
+                action_dim=ACTION_DIM,
+                num_candidates=getattr(cfg, "num_path_candidates", 8),
+                planner_temperature=getattr(cfg, "planner_temperature", 1.0),
+                use_pro_version=cfg.use_pro_version,
+            )
+        else:
+            action_head = L1RegressionActionHead(
+                input_dim=llm_dim,
+                hidden_dim=llm_dim,
+                action_dim=ACTION_DIM,
+                use_pro_version=cfg.use_pro_version,
+            )
 
     else:
         raise ValueError("Either use_l1_regression or use_diffusion must be True")

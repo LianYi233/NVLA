@@ -7,8 +7,8 @@ Implementations of various action heads, which serve as alternatives to VLM sequ
 import math
 import torch
 import torch.nn as nn
-from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX, NUM_TOKENS
-
+from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, \
+    STOP_INDEX, NUM_TOKENS
 
 
 def learnable_random_perturbations(seq_len, dim, device, dtype):
@@ -17,36 +17,36 @@ def learnable_random_perturbations(seq_len, dim, device, dtype):
     return random_perturbations
 
 
-
 class L1RegressionActionHead(nn.Module):
     """Simple MLP-based action head that generates continuous actions via L1 regression."""
+
     def __init__(
-        self,
-        input_dim=4096,
-        hidden_dim=4096,
-        action_dim=7,
-        num_task_tokens=512,
-        use_pro_version=False,
+            self,
+            input_dim=4096,
+            hidden_dim=4096,
+            action_dim=7,
+            num_task_tokens=512,
+            use_pro_version=False,
     ):
         super().__init__()
         self.num_task_tokens = num_task_tokens
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.model = MLPResNet(
-            num_blocks=24, 
-            input_dim=input_dim*ACTION_DIM, 
-            hidden_dim=hidden_dim, 
+            num_blocks=24,
+            input_dim=input_dim * ACTION_DIM,
+            hidden_dim=hidden_dim,
             output_dim=action_dim,
             use_pro_version=use_pro_version
-            )
+        )
 
     def predict_action(
-            self, 
-            actions_hidden_states, 
-            proprio=None, 
+            self,
+            actions_hidden_states,
+            proprio=None,
             proprio_projector=None,
             phase="Inference"
-            ):
+    ):
         batch_size = actions_hidden_states.shape[0]
         device = actions_hidden_states.device
 
@@ -60,7 +60,7 @@ class L1RegressionActionHead(nn.Module):
         cond_actions_hidden_states = torch.zeros(
             (batch_size, self.action_dim * NUM_ACTIONS_CHUNK, self.hidden_dim),
             device=device, dtype=actions_hidden_states.dtype
-        ).detach()  
+        ).detach()
 
         rearranged_actions_hidden_states = cond_actions_hidden_states.reshape(
             batch_size, NUM_ACTIONS_CHUNK, -1
@@ -68,31 +68,146 @@ class L1RegressionActionHead(nn.Module):
 
         if phase == "Training":
             batch_size, seq_len, dim = rearranged_actions_hidden_states.shape
-            random_perturbations = learnable_random_perturbations(seq_len, dim, device=rearranged_actions_hidden_states.device, dtype=rearranged_actions_hidden_states.dtype) 
-            rearranged_actions_hidden_states = (rearranged_actions_hidden_states + random_perturbations) # (1, seq_len, dim)
-            print("-----------------")
+            random_perturbations = learnable_random_perturbations(seq_len, dim,
+                                                                  device=rearranged_actions_hidden_states.device,
+                                                                  dtype=rearranged_actions_hidden_states.dtype)
+            rearranged_actions_hidden_states = (
+                        rearranged_actions_hidden_states + random_perturbations)  # (1, seq_len, dim)
+            print("---------ah tr--------")
 
         action = self.model(
             rearranged_actions_hidden_states,
             h_a=actions_hidden_states,
             p=proprio_features,
             h_t=task_hidden_states
-            )
+        )
 
         return action
+
+
+
+class PathPlannerActionHead(nn.Module):
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        action_dim=7,
+        num_task_tokens=512,
+        num_candidates=8,
+        planner_temperature=1.0,
+        use_pro_version=False,
+    ):
+        super().__init__()
+        self.num_task_tokens = num_task_tokens
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+        self.num_candidates = num_candidates
+        self.planner_temperature = planner_temperature
+
+        # 1) proposal: 每个 step 生成 K 个候选 latent nodes
+        self.proposal = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_candidates * hidden_dim),
+        )
+
+        # 2) node / edge energy
+        self.node_energy = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.edge_energy = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # 3) decoder: 从最优路径 latent 解码动作
+        self.decoder = MLPResNet(
+            num_blocks=24,
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            output_dim=action_dim,
+            use_pro_version=use_pro_version,
+        )
+
+    def _build_candidates(self, actions_hidden_states):
+        # actions_hidden_states: [B, L, NUM_TOKENS, D] or related pooled feature
+        B = actions_hidden_states.shape[0]
+        pooled = actions_hidden_states.mean(dim=(1, 2))              # [B, D]
+        cand = self.proposal(pooled)                                 # [B, K*D]
+        cand = cand.view(B, self.num_candidates, self.hidden_dim)    # [B, K, D]
+        return cand
+
+    def _plan_path(self, cand):
+        # 最简版先做 node-only 选择；后面再升级为 edge-aware DP / beam search
+        node_e = self.node_energy(cand).squeeze(-1)                  # [B, K]
+        best_idx = torch.argmin(node_e, dim=-1)                      # [B]
+        best = cand[torch.arange(cand.size(0), device=cand.device), best_idx]  # [B, D]
+        return best, node_e, best_idx
+
+    def predict_action(
+        self,
+        actions_hidden_states,
+        proprio=None,
+        proprio_projector=None,
+        phase="Inference",
+        return_dict=False,
+    ):
+        batch_size = actions_hidden_states.shape[0]
+
+        task_hidden_states = actions_hidden_states[:, :, :self.num_task_tokens, :]
+        actions_hidden_states = actions_hidden_states[:, :, self.num_task_tokens:, :]
+
+        cand = self._build_candidates(actions_hidden_states)
+        best_path_latent, node_energy, best_idx = self._plan_path(cand)
+
+        # 扩成 chunk 维度，先做最简版：同一个 path latent 解每个 step
+        dec_in = best_path_latent.unsqueeze(1).repeat(1, NUM_ACTIONS_CHUNK, 1)
+        # pred = self.decoder(dec_in, h_a=actions_hidden_states[:, :24, :1, :], h_t=task_hidden_states[:, :24, :1, :], p=None)
+        if proprio is not None and proprio_projector is not None:
+            proprio = proprio.reshape(batch_size, -1).to(dec_in.dtype)
+            p = proprio_projector(proprio).unsqueeze(1)   # [B, 1, hidden_dim]
+        else:
+            p = torch.zeros(
+                batch_size, 1, self.hidden_dim,
+                device=dec_in.device,
+                dtype=dec_in.dtype,
+            )
+
+        pred = self.decoder(
+            dec_in,
+            h_a=actions_hidden_states[:, :, :1, :],
+            h_t=task_hidden_states[:, :, :1, :],
+            p=p,
+        )
+
+        if return_dict:
+            return {
+                "actions": pred,
+                "plan_loss": node_energy.mean(),
+                "energy_loss": node_energy.mean(),
+                "best_idx": best_idx,
+            }
+        return pred
     
 
 class MLPResNet(nn.Module):
     """MLP with residual connection blocks."""
+
     def __init__(
-            self, 
-            num_blocks, 
-            input_dim, 
-            hidden_dim, 
+            self,
+            num_blocks,
+            input_dim,
+            hidden_dim,
             output_dim,
             use_pro_version=False
-            ):
-        
+    ):
+
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(input_dim)
         self.fc1 = nn.Linear(input_dim, hidden_dim)
@@ -104,23 +219,21 @@ class MLPResNet(nn.Module):
                 self.mlp_resnet_blocks.append(MLPResNetBlock_Pro(dim=hidden_dim))
             else:
                 self.mlp_resnet_blocks.append(MLPResNetBlock(dim=hidden_dim))
-                
+
         self.layer_norm2 = nn.LayerNorm(hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
 
+    def forward(self, x, h_a=None, h_t=None, p=None):
 
-    def forward(self, x, h_a=None, h_t=None, p= None):
- 
         # x: (batch_size, input_dim)
         x = self.layer_norm1(x)  # shape: (batch_size, input_dim)
         x = self.fc1(x)  # shape: (batch_size, hidden_dim)
         x = self.relu(x)  # shape: (batch_size, hidden_dim)
         for i, block in enumerate(self.mlp_resnet_blocks):
-            x = block(x, h_t = h_t[:,i+1,:], h_a = h_a[:,i+1,:], p=p)  # shape: (batch_size, hidden_dim)
+            x = block(x, h_t=h_t[:, i + 1, :], h_a=h_a[:, i + 1, :], p=p)  # shape: (batch_size, hidden_dim)
         x = self.layer_norm2(x)  # shape: (batch_size, hidden_dim)
         x = self.fc2(x)  # shape: (batch_size, output_dim)
-        return x   
-
+        return x
 
 
 def apply_rope(q, k, cos, sin):
@@ -132,20 +245,17 @@ def apply_rope(q, k, cos, sin):
     cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, T, D)
     sin = sin.unsqueeze(0).unsqueeze(0)
 
-
     def rotate_half(x):
         # Swap even and odd dimensions and flip the signs
-        x1 = x[..., ::2]   # Even subdimension
+        x1 = x[..., ::2]  # Even subdimension
         x2 = x[..., 1::2]  # odd subdimension
 
         return torch.stack((-x2, x1), dim=-1).reshape_as(x)
-
 
     q_rot = (q * cos) + (rotate_half(q) * sin)
     k_rot = (k * cos) + (rotate_half(k) * sin)
 
     return q_rot, k_rot
-
 
 
 class RotaryPositionEmbedding(nn.Module):
@@ -161,9 +271,8 @@ class RotaryPositionEmbedding(nn.Module):
     def forward(self, seq_len, device, dtype):
         t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # (T, dim/2)
-        emb = torch.cat([freqs, freqs], dim=-1)            # (T, dim)
+        emb = torch.cat([freqs, freqs], dim=-1)  # (T, dim)
         return emb.cos().to(dtype), emb.sin().to(dtype)
-
 
 
 class MLPResNetBlock(nn.Module):
@@ -193,10 +302,11 @@ class MLPResNetBlock(nn.Module):
     Returns:
         torch.Tensor: Output tensor of shape (batch_size, seq_len, hidden_dim).
     """
+
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        
+
         # Main feedforward network
         self.ffn = nn.Sequential(
             nn.LayerNorm(dim),
@@ -213,8 +323,6 @@ class MLPResNetBlock(nn.Module):
         self.o_proj = nn.Linear(dim, dim)
 
         self.gating_factor = nn.Parameter(torch.zeros(1))
-
-
 
     def forward(self, x, h_t=None, h_a=None, p=None):
         """
@@ -245,18 +353,18 @@ class MLPResNetBlock(nn.Module):
         adapter_k = h_t
         adapter_v = h_t
 
-        q_1 = self.q_proj(x) # (B, T, C)
-        k_tokens = self.k_proj(x)             # (B, T, C)
-        v_tokens = self.v_proj(x)             # (B, T, C)
-        k_task = self.k_proj(task_k)    # (B, K, C)
-        v_task = self.v_proj(task_v)    # (B, K, C)
+        q_1 = self.q_proj(x)  # (B, T, C)
+        k_tokens = self.k_proj(x)  # (B, T, C)
+        v_tokens = self.v_proj(x)  # (B, T, C)
+        k_task = self.k_proj(task_k)  # (B, K, C)
+        v_task = self.v_proj(task_v)  # (B, K, C)
 
-        k_adapter = self.k_proj(adapter_k)    # (B, K, C)
-        v_adapter = self.v_proj(adapter_v)    # (B, K, C)
+        k_adapter = self.k_proj(adapter_k)  # (B, K, C)
+        v_adapter = self.v_proj(adapter_v)  # (B, K, C)
 
         # (B, seq_len, C) -> (B, num_heads, seq_len, head_dim)
         q_1 = q_1.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        
+
         k_tokens = k_tokens.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v_tokens = v_tokens.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k_task = k_task.view(B, K_t, self.num_heads, self.head_dim).transpose(1, 2)
@@ -265,24 +373,23 @@ class MLPResNetBlock(nn.Module):
         k_adapter = k_adapter.view(B, K, self.num_heads, self.head_dim).transpose(1, 2)
         v_adapter = v_adapter.view(B, K, self.num_heads, self.head_dim).transpose(1, 2)
 
-        attn_scores_tokens = torch.matmul(q_1, k_tokens.transpose(-2, -1)) # (B, H, T, T)
-        attn_scores_task = torch.matmul(q_1, k_task.transpose(-2, -1)) * 1 # (B, H, T, K)
-        attn_scores_adapter = torch.matmul(q_1, k_adapter.transpose(-2, -1)) * ratio_g # (B, H, T, K)
+        attn_scores_tokens = torch.matmul(q_1, k_tokens.transpose(-2, -1))  # (B, H, T, T)
+        attn_scores_task = torch.matmul(q_1, k_task.transpose(-2, -1)) * 1  # (B, H, T, K)
+        attn_scores_adapter = torch.matmul(q_1, k_adapter.transpose(-2, -1)) * ratio_g  # (B, H, T, K)
 
-        attn_scores = torch.cat([attn_scores_tokens, attn_scores_task, attn_scores_adapter], dim=-1) # (B, H, T, T+K)
+        attn_scores = torch.cat([attn_scores_tokens, attn_scores_task, attn_scores_adapter], dim=-1)  # (B, H, T, T+K)
         attn_scores = attn_scores / math.sqrt(self.head_dim)
-        attn_weights = torch.softmax(attn_scores, dim=-1) # (B, H, T, T+K)
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # (B, H, T, T+K)
 
-        v_combined = torch.cat([v_tokens, v_task, v_adapter], dim=2) # (B, H, T+K, head_dim)
-        output = torch.matmul(attn_weights, v_combined) # (B, H, T, head_dim)
+        v_combined = torch.cat([v_tokens, v_task, v_adapter], dim=2)  # (B, H, T+K, head_dim)
+        output = torch.matmul(attn_weights, v_combined)  # (B, H, T, head_dim)
 
         output = output.transpose(1, 2).contiguous().view(B, T, C)
         output = self.o_proj(output)
 
-        x = self.ffn(output + x) 
+        x = self.ffn(output + x)
 
         return x
-
 
 
 class MLPResNetBlock_Pro(nn.Module):
@@ -298,7 +405,7 @@ class MLPResNetBlock_Pro(nn.Module):
             nn.LayerNorm(dim),
             nn.Linear(dim, dim),
             nn.ReLU(),
-            )
+        )
 
         # Q (from x only)
         self.q_proj = nn.Linear(dim, dim)
@@ -327,13 +434,11 @@ class MLPResNetBlock_Pro(nn.Module):
         # FiLM is useless; to avoid conflict with chkpt, it can be kept as is for now.
         self.film_gen = nn.Sequential(
             nn.Linear(dim, dim * 2),  # output γ and β
-            )
-
+        )
 
     def apply_film(self, x, gamma, beta):
         """FiLM: per-channel modulation"""
         return gamma.unsqueeze(1) * x + beta.unsqueeze(1)
-
 
     def forward(self, x, h_a=None, h_t=None, p=None):
         """
@@ -345,7 +450,7 @@ class MLPResNetBlock_Pro(nn.Module):
         ratio_g = torch.tanh(g)
 
         # concat h_a and p
-        h_adapter = torch.cat((h_a, p),dim=1)
+        h_adapter = torch.cat((h_a, p), dim=1)
 
         h_task = h_t
         B, T, C = x.shape
@@ -367,11 +472,9 @@ class MLPResNetBlock_Pro(nn.Module):
         k_task = self.k_task(h_task)
         v_task = self.v_task(h_task)
 
-
         # reshape -> multi-head
         def reshape_heads(t, B, L):
             return t.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-
 
         q_1 = reshape_heads(q_1, B, T)
         k_tokens, v_tokens = reshape_heads(k_tokens, B, T), reshape_heads(v_tokens, B, T)
@@ -382,7 +485,7 @@ class MLPResNetBlock_Pro(nn.Module):
         cos_main, sin_main = self.rope(seq_len=T, device=x.device, dtype=x.dtype)
         q_1, k_tokens = apply_rope(q_1, k_tokens, cos_main, sin_main)
         cos_a, sin_a = self.rope(seq_len=K_a, device=x.device, dtype=x.dtype)
-        _, k_adapter = apply_rope(k_adapter, k_adapter, cos_a, sin_a)     
+        _, k_adapter = apply_rope(k_adapter, k_adapter, cos_a, sin_a)
         cos_t, sin_t = self.rope(seq_len=K_t, device=x.device, dtype=x.dtype)
         _, k_task = apply_rope(k_task, k_task, cos_t, sin_t)
 
@@ -394,14 +497,14 @@ class MLPResNetBlock_Pro(nn.Module):
         attn_weights = torch.softmax(attn_scores, dim=-1)
 
         # combine V
-        v_list = [v_tokens,v_adapter,v_task]
+        v_list = [v_tokens, v_adapter, v_task]
         v_combined = torch.cat(v_list, dim=2)
 
         output = torch.matmul(attn_weights, v_combined)
         output = output.transpose(1, 2).contiguous().view(B, T, C)
         output = self.o_proj(output)
 
-        # # ---- FiLM ---- 
+        # # ---- FiLM ----
         # gamma_beta = self.film_gen(p)  # [B, 2C]
         # gamma, beta = gamma_beta.chunk(2, dim=-1)  # [B, C], [B, C]
         # output = self.apply_film(output, gamma, beta)

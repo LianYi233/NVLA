@@ -794,7 +794,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     processor = AutoProcessor.from_pretrained(cfg.config_file_path, trust_remote_code=True)
 
     if cfg.use_minivlm:
-        hf_token = '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'
+        hf_token = ''
         if 'prism-qwen25-extra-dinosiglip-224px-0_5b' in cfg.vlm_path:
 
             vlm = load(cfg.vlm_path, hf_token=hf_token, load_for_training=True)

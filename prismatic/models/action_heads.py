@@ -7,6 +7,7 @@ Implementations of various action heads, which serve as alternatives to VLM sequ
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, \
     STOP_INDEX, NUM_TOKENS
 
@@ -17,73 +18,192 @@ def learnable_random_perturbations(seq_len, dim, device, dtype):
     return random_perturbations
 
 
-class L1RegressionActionHead(nn.Module):
-    """Simple MLP-based action head that generates continuous actions via L1 regression."""
-
+class ActionPrior(nn.Module):
+    """
+    Action-only prior that can be pretrained using only action chunks.
+    During pretraining:
+        input = noisy action chunk
+        target = clean action chunk
+    During joint finetuning / inference:
+        input = learned default queries
+    """
     def __init__(
-            self,
-            input_dim=4096,
-            hidden_dim=4096,
-            action_dim=7,
-            num_task_tokens=512,
-            use_pro_version=False,
+        self,
+        action_dim=7,
+        hidden_dim=4096,
+        chunk_len=NUM_ACTIONS_CHUNK,
+        num_layers=2,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+        self.chunk_len = chunk_len
+
+        # If seed actions are provided, project them in
+        self.in_proj = nn.Linear(action_dim, hidden_dim)
+
+        # If no seed actions are provided, use learned default queries
+        self.default_queries = nn.Parameter(torch.zeros(1, chunk_len, hidden_dim))
+        nn.init.normal_(self.default_queries, mean=0.0, std=0.02)
+
+        # temporal modeling
+        self.gru = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+
+        # predict action chunk
+        self.out_proj = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, seed_actions=None, batch_size=None):
+        """
+        seed_actions: [B, H, action_dim] or None
+        returns:
+            pred_actions: [B, H, action_dim]
+            latent:       [B, H, hidden_dim]
+        """
+        if seed_actions is not None:
+            x = self.in_proj(seed_actions)                  # [B, H, D]
+        else:
+            assert batch_size is not None
+            x = self.default_queries.repeat(batch_size, 1, 1)  # [B, H, D]
+
+        latent, _ = self.gru(x)                            # [B, H, D]
+        pred_actions = self.out_proj(latent)               # [B, H, A]
+        return pred_actions, latent
+    
+class L1RegressionActionHead(nn.Module):
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        action_dim=7,
+        num_task_tokens=512,
+        use_pro_version=False,
+        action_prior_num_layers=2,
+        action_prior_hidden_dim=None,
     ):
         super().__init__()
         self.num_task_tokens = num_task_tokens
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
+
+        # 1) action prior branch (pretrained using action-only data)
+        if action_prior_hidden_dim is None:
+            action_prior_hidden_dim = hidden_dim
+
+        self.action_prior = ActionPrior(
+            action_dim=action_dim,
+            hidden_dim=action_prior_hidden_dim,
+            num_layers=action_prior_num_layers,
+        )
+
+        # Learnable seed actions for prior generation in joint training
+        self.prior_queries = nn.Parameter(torch.zeros(NUM_ACTIONS_CHUNK, action_dim))
+        nn.init.normal_(self.prior_queries, mean=0.0, std=0.02)
+
+        # 2) conditional residual branch (conditioned on VLA hidden states)
         self.model = MLPResNet(
             num_blocks=24,
             input_dim=input_dim * ACTION_DIM,
             hidden_dim=hidden_dim,
             output_dim=action_dim,
-            use_pro_version=use_pro_version
+            use_pro_version=use_pro_version,
         )
 
+    def _compute_smooth_loss(self, actions):
+        """
+        actions: [B, H, A]
+        """
+        if actions.shape[1] <= 1:
+            return actions.new_tensor(0.0)
+        return ((actions[:, 1:] - actions[:, :-1]) ** 2).mean()
+
+    def pretrain_action_prior(
+        self,
+        gt_actions,
+        noise_std=0.01,
+        lambda_smooth=0.01,
+    ):
+        """
+        Used by pretrain_action_prior.py
+        gt_actions: [B, H, A]
+        """
+        noisy_actions = gt_actions + noise_std * torch.randn_like(gt_actions)
+        pred_actions, _ = self.action_prior(noisy_actions)
+
+        recon_loss = F.l1_loss(pred_actions, gt_actions)
+        smooth_loss = self._compute_smooth_loss(pred_actions)
+        loss = recon_loss + lambda_smooth * smooth_loss
+
+        return {
+            "loss": loss,
+            "recon_loss": recon_loss,
+            "smooth_loss": smooth_loss,
+            "pred_actions": pred_actions,
+        }
+
     def predict_action(
-            self,
-            actions_hidden_states,
-            proprio=None,
-            proprio_projector=None,
-            phase="Inference"
+        self,
+        actions_hidden_states,
+        proprio=None,
+        proprio_projector=None,
+        phase="Inference"
     ):
         batch_size = actions_hidden_states.shape[0]
         device = actions_hidden_states.device
+        dtype = actions_hidden_states.dtype
 
-        proprio = proprio.reshape(batch_size, -1).to(torch.bfloat16)  # (bsz, proprio_dim)
-        proprio_features = proprio_projector(proprio)  # (bsz, llm_dim)
-        proprio_features = proprio_features.unsqueeze(dim=1)  # (bsz, 1, llm_dim)
+        # proprio branch
+        if proprio is not None and proprio_projector is not None:
+            proprio = proprio.reshape(batch_size, -1).to(dtype)
+            proprio_features = proprio_projector(proprio).unsqueeze(dim=1)  # [B, 1, D]
+        else:
+            proprio_features = torch.zeros(
+                batch_size, 1, self.hidden_dim, device=device, dtype=dtype
+            )
 
         task_hidden_states = actions_hidden_states[:, :, :self.num_task_tokens, :]
         actions_hidden_states = actions_hidden_states[:, :, self.num_task_tokens:, :]
 
+        # original conditional input used by residual branch
         cond_actions_hidden_states = torch.zeros(
             (batch_size, self.action_dim * NUM_ACTIONS_CHUNK, self.hidden_dim),
-            device=device, dtype=actions_hidden_states.dtype
+            device=device,
+            dtype=dtype,
         ).detach()
 
         rearranged_actions_hidden_states = cond_actions_hidden_states.reshape(
             batch_size, NUM_ACTIONS_CHUNK, -1
-        )  # (batch, chunk_len, action_dim * hidden_dim)
+        )  # [B, H, action_dim * hidden_dim]
 
         if phase == "Training":
-            batch_size, seq_len, dim = rearranged_actions_hidden_states.shape
-            random_perturbations = learnable_random_perturbations(seq_len, dim,
-                                                                  device=rearranged_actions_hidden_states.device,
-                                                                  dtype=rearranged_actions_hidden_states.dtype)
-            rearranged_actions_hidden_states = (
-                        rearranged_actions_hidden_states + random_perturbations)  # (1, seq_len, dim)
-            print("---------ah tr--------")
+            _, seq_len, dim = rearranged_actions_hidden_states.shape
+            random_perturbations = learnable_random_perturbations(
+                seq_len,
+                dim,
+                device=rearranged_actions_hidden_states.device,
+                dtype=rearranged_actions_hidden_states.dtype,
+            )
+            rearranged_actions_hidden_states = rearranged_actions_hidden_states + random_perturbations
 
-        action = self.model(
+        # 1) prior action generation
+        prior_seed = self.prior_queries.unsqueeze(0).expand(batch_size, -1, -1).to(dtype)
+        prior_actions, _ = self.action_prior(prior_seed)   # [B, H, A]
+
+        # 2) conditional residual correction
+        delta_actions = self.model(
             rearranged_actions_hidden_states,
             h_a=actions_hidden_states,
             p=proprio_features,
-            h_t=task_hidden_states
-        )
+            h_t=task_hidden_states,
+        )  # [B, H, A]
 
+        # final action = prior + conditional residual
+        action = prior_actions + delta_actions
         return action
-
 
 
 class PathPlannerActionHead(nn.Module):
@@ -450,7 +570,15 @@ class MLPResNetBlock_Pro(nn.Module):
         ratio_g = torch.tanh(g)
 
         # concat h_a and p
-        h_adapter = torch.cat((h_a, p), dim=1)
+        # h_adapter = torch.cat((h_a, p), dim=1)
+        if h_a is None and p is None:
+            raise ValueError("Both h_a and p are None in MLPResNetBlock_Pro.forward")
+        if h_a is None:
+            h_adapter = p
+        elif p is None:
+            h_adapter = h_a
+        else:
+            h_adapter = torch.cat((h_a, p), dim=1)
 
         h_task = h_t
         B, T, C = x.shape

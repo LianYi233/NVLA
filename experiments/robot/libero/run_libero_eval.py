@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
-
+# Append current directory so that interpreter can find experiments.robot
+sys.path.append("../..")
+sys.path.append("/home/wyn/2501-NVLA/VLA-Adapter/LIBERO/")
 import draccus
 import numpy as np
 import tqdm
@@ -21,8 +23,7 @@ from libero.libero import benchmark
 
 import wandb
 
-# Append current directory so that interpreter can find experiments.robot
-sys.path.append("../..")
+
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,

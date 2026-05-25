@@ -1,7 +1,19 @@
 """
-finetune.py
+2025-10- latest
+modified from VLA-adapter & MoA
 
+finetune.py
 Fine-tunes Qwen2.5-0.5B via LoRA.
+
+run:
+CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nnodes 1 --nproc_per_node 1 vla-scripts/finetune.py \
+--vlm_path pretrained_models/prism-qwen25-extra-dinosiglip-224px-0_5b --config_file_path pretrained_models/configs --data_root_dir data/libero \
+--dataset_name $data_name (in ./data/libero: libero_object_no_noops)
+--run_root_dir outputs --use_film False --num_images_in_input 2 \
+--use_proprio True --use_lora True --use_fz False --use_minivlm True --image_aug True --num_steps_before_decay 200000 \
+--max_steps 200005 --save_freq 5000 --save_latest_checkpoint_only False --merge_lora_during_training True \
+--batch_size 4 --grad_accumulation_steps 4 --learning_rate 2e-4 --lora_rank 64 --use_pro_version True
+
 """
 
 import os
@@ -59,9 +71,9 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from prismatic.models import load, load_vla
 
 
-
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 @dataclass
 class FinetuneConfig:
@@ -733,10 +745,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Print detected constants
     print(
         "Detected constants:\n"
-        f"\tNUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}\n"
-        f"\tACTION_DIM: {ACTION_DIM}\n"
-        f"\tPROPRIO_DIM: {PROPRIO_DIM}\n"
-        f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}"
+        f"\tNUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}\n"       # 8
+        f"\tACTION_DIM: {ACTION_DIM}\n"     # 7
+        f"\tPROPRIO_DIM: {PROPRIO_DIM}\n"   # 8
+        f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}"     # bounds_q99
     )
 
     # Two options:
@@ -830,6 +842,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # vla.set_version(cfg.version)
 
     if cfg.use_lora:
+        print("lora used")
         lora_config = LoraConfig(
             r=cfg.lora_rank,
             lora_alpha= 2 * cfg.lora_rank,
@@ -841,9 +854,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
+                print('---action_queries:---', name, 'requires_grad=', param.requires_grad)
+            elif param.requires_grad:
+                print('---not action_queries:---', name, 'requires_grad=', param.requires_grad)
+                param.requires_grad = False     # all layers of VLM are frozen
         vla.print_trainable_parameters()
 
     else:
+        print('no lora')
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
@@ -901,6 +919,10 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Instantiate optimizer
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
+    # print("trainable_params", trainable_params)
+
+    print("-----", [param for param in vlm.vision_backbone.parameters() if param.requires_grad])
+
     if cfg.use_l1_regression:
         trainable_params += [param for param in action_head.parameters() if param.requires_grad]
 

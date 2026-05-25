@@ -1,0 +1,13 @@
+2025-10-24 20:38:53,478 ERROR   wandb-AsyncioManager-main:1197682 [service_client.py:_forward_responses():77] Error reading server response.
+Traceback (most recent call last):
+  File "/home/drx/miniconda3/envs/vlaa/lib/python3.10/site-packages/wandb/sdk/lib/service/service_client.py", line 73, in _forward_responses
+    while response := await self._read_server_response():
+  File "/home/drx/miniconda3/envs/vlaa/lib/python3.10/site-packages/wandb/sdk/lib/service/service_client.py", line 87, in _read_server_response
+    header = await self._reader.readexactly(_HEADER_BYTE_INT_LEN)
+  File "/home/drx/miniconda3/envs/vlaa/lib/python3.10/asyncio/streams.py", line 708, in readexactly
+    await self._wait_for_data('readexactly')
+  File "/home/drx/miniconda3/envs/vlaa/lib/python3.10/asyncio/streams.py", line 501, in _wait_for_data
+    await self._waiter
+  File "/home/drx/miniconda3/envs/vlaa/lib/python3.10/asyncio/selector_events.py", line 924, in write
+    n = self._sock.send(data)
+BrokenPipeError: [Errno 32] Broken pipe

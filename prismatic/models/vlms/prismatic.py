@@ -190,6 +190,7 @@ class PrismaticVLM(VLM):
             self.projector.requires_grad_(False)
             self.llm_backbone.requires_grad_(False)
 
+
             # Unfreeze final LLM layer
             for module in self.llm_backbone.last_layer_finetune_modules:
                 module.requires_grad_(True)

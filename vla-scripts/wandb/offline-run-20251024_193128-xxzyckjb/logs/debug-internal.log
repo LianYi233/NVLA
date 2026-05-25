@@ -1,0 +1,8 @@
+{"time":"2025-10-24T19:31:28.851584561+08:00","level":"INFO","msg":"stream: starting","core version":"0.22.2"}
+{"time":"2025-10-24T19:31:28.971504675+08:00","level":"WARN","msg":"featurechecker: GraphQL client is nil, skipping feature loading"}
+{"time":"2025-10-24T19:31:28.971555304+08:00","level":"INFO","msg":"stream: created new stream","id":"xxzyckjb"}
+{"time":"2025-10-24T19:31:28.97157042+08:00","level":"INFO","msg":"handler: started","stream_id":"xxzyckjb"}
+{"time":"2025-10-24T19:31:28.9716051+08:00","level":"INFO","msg":"stream: started","id":"xxzyckjb"}
+{"time":"2025-10-24T19:31:28.9716207+08:00","level":"INFO","msg":"writer: started","stream_id":"xxzyckjb"}
+{"time":"2025-10-24T19:31:28.971639551+08:00","level":"INFO","msg":"sender: started","stream_id":"xxzyckjb"}
+{"time":"2025-10-24T19:31:28.971936086+08:00","level":"WARN","msg":"runupserter: server does not expand metric globs but the x_server_side_expand_glob_metrics setting is set; ignoring"}

@@ -1,1 +1,19 @@
 LIBERO/
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# logs
+logs/
+experiments/logs/
+vla-scripts/wandb/
+wandb/
+
+# training artifacts
+*.log
+*.txt
+
+# environments
+.venv/
+env/

@@ -98,9 +98,9 @@ class FinetuneConfig:
     lambda_plan: float = 0.1
     lambda_energy: float = 0.1
     ## about pretraining action head
-    use_action_prior_init: bool = False
-    action_prior_ckpt: Optional[str] = None
-    strict_action_prior_load: bool = True
+    use_action_head_init: bool = False
+    action_head_ckpt: Optional[str] = None
+    strict_action_head_load: bool = True
     action_prior_num_layers: int = 2
     action_prior_hidden_dim: int = 4096
     
@@ -957,7 +957,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 head_cls = L1RegressionActionHead
                 head_args = {
                     "input_dim": vla.module.llm_dim,
-                    "hidden_dim": vla.module.llm_dim,   # conditional residual branch dim
+                    "hidden_dim": vla.module.llm_dim,
                     "action_dim": ACTION_DIM,
                     "use_pro_version": cfg.use_pro_version,
                     "action_prior_num_layers": cfg.action_prior_num_layers,
@@ -973,27 +973,51 @@ def finetune(cfg: FinetuneConfig) -> None:
                 to_bf16=True,
             )
 
-            # Load pretrained action prior only for L1RegressionActionHead
+            # # Load pretrained action prior only for L1RegressionActionHead
+            # if (
+            #     (not cfg.use_path_planner)
+            #     and cfg.use_action_prior_init
+            #     and cfg.action_prior_ckpt is not None
+            # ):
+            #     print(f"Loading pretrained action prior from: {cfg.action_prior_ckpt}")
+            #     prior_state = torch.load(cfg.action_prior_ckpt, map_location="cpu", weights_only=True)
+
+            #     cleaned_state = {}
+            #     for k, v in prior_state.items():
+            #         if k.startswith("module."):
+            #             cleaned_state[k[7:]] = v
+            #         else:
+            #             cleaned_state[k] = v
+
+            #     missing, unexpected = action_head.module.action_prior.load_state_dict(
+            #         cleaned_state,
+            #         strict=cfg.strict_action_prior_load,
+            #     )
+            #     print("Loaded pretrained action_prior successfully.")
+            #     print("missing keys:", missing)
+            #     print("unexpected keys:", unexpected)
+
             if (
-                (not cfg.use_path_planner)
-                and cfg.use_action_prior_init
-                and cfg.action_prior_ckpt is not None
+                cfg.use_l1_regression
+                and (not cfg.use_path_planner)
+                and getattr(cfg, "use_action_head_init", False)
+                and getattr(cfg, "action_head_ckpt", None) is not None
             ):
-                print(f"Loading pretrained action prior from: {cfg.action_prior_ckpt}")
-                prior_state = torch.load(cfg.action_prior_ckpt, map_location="cpu", weights_only=True)
+                print(f"Loading pretrained full action head from: {cfg.action_head_ckpt}")
+                state = torch.load(cfg.action_head_ckpt, map_location="cpu", weights_only=True)
 
                 cleaned_state = {}
-                for k, v in prior_state.items():
+                for k, v in state.items():
                     if k.startswith("module."):
                         cleaned_state[k[7:]] = v
                     else:
                         cleaned_state[k] = v
 
-                missing, unexpected = action_head.module.action_prior.load_state_dict(
+                missing, unexpected = action_head.module.load_state_dict(
                     cleaned_state,
-                    strict=cfg.strict_action_prior_load,
+                    strict=cfg.strict_action_head_load,
                 )
-                print("Loaded pretrained action_prior successfully.")
+                print("Loaded pretrained full action head successfully.")
                 print("missing keys:", missing)
                 print("unexpected keys:", unexpected)
 
